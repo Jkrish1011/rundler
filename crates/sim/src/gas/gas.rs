@@ -337,5 +337,8 @@ where
             };
             Arc::new(UsageBasedFeeOracle::new(provider, config))
         }
+        chain::PriorityFeeOracleType::Fixed => {
+            Arc::new(ConstantOracle::new(chain_spec.min_max_priority_fee_per_gas))
+        }
     }
 }

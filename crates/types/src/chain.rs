@@ -121,6 +121,8 @@ pub enum PriorityFeeOracleType {
     Provider,
     /// Use the usage based oracle
     UsageBased,
+    /// Use a fixed priority fee. Uses the min_max_priority_fee_per_gas value.
+    Fixed,
 }
 
 impl Default for ChainSpec {

@@ -44,6 +44,8 @@ pub(crate) trait BundleSender: Send + Sync + 'static {
 pub(crate) struct Settings {
     pub(crate) replacement_fee_percent_increase: u64,
     pub(crate) max_fee_increases: u64,
+    pub(crate) max_blocks_to_wait_for_mine: u64,
+    pub(crate) max_blocks_to_wait_stuck: u64,
 }
 
 #[derive(Debug)]
@@ -137,10 +139,15 @@ where
         let mut timer = tokio::time::interval(Duration::from_millis(
             self.chain_spec.bundle_max_send_interval_millis,
         ));
+        let mut sender_stuck = None;
+
         loop {
             let mut send_bundle_response: Option<oneshot::Sender<SendBundleResult>> = None;
             let mut last_block = None;
 
+            // Wait for new block. Block number doesn't matter as the pool will only notify of new blocks
+            // after the pool has updated its state. The bundle will be formed using the latest pool state
+            // and can land in the next block
             // 3 triggers for loop logic:
             // 1 - new block
             //      - If auto mode, send next bundle
@@ -205,30 +212,62 @@ where
                 }
             }
 
-            // Wait for new block. Block number doesn't matter as the pool will only notify of new blocks
-            // after the pool has updated its state. The bundle will be formed using the latest pool state
-            // and can land in the next block
-            self.check_for_and_log_transaction_update().await;
+            if self.check_for_and_log_transaction_update().await {
+                // returns true if a transaction was mined
+                sender_stuck = None;
+            }
+
+            if let Some(stuck_since) = sender_stuck {
+                info!("Sender has been stuck since block {stuck_since}");
+
+                // TODO If we're stuck for N blocks, issue a cancellation transaction
+            }
+
             let result = self.send_bundle_with_increasing_gas_fees().await;
             match &result {
                 SendBundleResult::Success {
                     block_number,
                     attempt_number,
                     tx_hash,
-                } =>
+                } => {
                     if *attempt_number == 0 {
                         info!("Bundle with hash {tx_hash:?} landed in block {block_number}");
                     } else {
                         info!("Bundle with hash {tx_hash:?} landed in block {block_number} after increasing gas fees {attempt_number} time(s)");
                     }
-                SendBundleResult::NoOperationsInitially => trace!("No ops to send at block {}", last_block.unwrap_or_default().block_number),
+
+                    // Unstuck the sender, bundle landed
+                    sender_stuck = None;
+                }
+                SendBundleResult::NoOperationsInitially => trace!(
+                    "No ops to send at block {}",
+                    last_block.unwrap_or_default().block_number
+                ),
                 SendBundleResult::NoOperationsAfterFeeIncreases {
                     initial_op_count,
                     attempt_number,
-                } => info!("Bundle initially had {initial_op_count} operations, but after increasing gas fees {attempt_number} time(s) it was empty"),
-                SendBundleResult::StalledAtMaxFeeIncreases => warn!("Bundle failed to mine after {} fee increases", self.settings.max_fee_increases),
+                } => {
+                    // TODO this is wrong - we return this even if we don't send a bundle
+
+                    // We sent a bundle, it didn't land, tried to replace it, and the replacement didn't land
+                    // SO we have a transaction that is pending.
+                    sender_stuck = Some(last_block.unwrap_or_default().block_number);
+                    info!("Bundle initially had {initial_op_count} operations, but after increasing gas fees {attempt_number} time(s) it was empty")
+                }
+                SendBundleResult::StalledAtMaxFeeIncreases => {
+                    // We sent a bundle, it didn't land, tried to replace it, and the replacement didn't land
+                    // SO we have a transaction that is pending.
+                    sender_stuck = Some(last_block.unwrap_or_default().block_number);
+                    warn!(
+                        "Bundle failed to mine after {} fee increases",
+                        self.settings.max_fee_increases
+                    )
+                }
                 SendBundleResult::Error(error) => {
-                    BuilderMetrics::increment_bundle_txns_failed(self.builder_index, self.entry_point.address());
+                    BuilderMetrics::increment_bundle_txns_failed(
+                        self.builder_index,
+                        self.entry_point.address(),
+                    );
                     error!("Failed to send bundle. Will retry next block: {error:#?}");
                 }
             }
@@ -280,17 +319,130 @@ where
         }
     }
 
-    async fn check_for_and_log_transaction_update(&self) {
+    async fn send_bundles_in_loop_2(mut self) -> anyhow::Result<()> {
+        enum PendingKind {
+            Bundle,
+            Cancel,
+        }
+
+        enum State {
+            Building,
+            // (attempt_until_block, max_until_block, pending_kind)
+            Pending(u64, u64, PendingKind),
+        }
+
+        let mut state = State::Building;
+        let mut last_block = 0;
+
+        loop {
+            match state {
+                State::Building => {
+                    // TODO wait for trigger
+
+                    // build bundle
+                    // TODO: handle replacement underpriced by moving to cancellation
+                    if self.send_bundle().await {
+                        state = State::Pending(
+                            last_block + self.settings.max_blocks_to_wait_for_mine,
+                            last_block
+                                + self.settings.max_blocks_to_wait_for_mine
+                                    * self.settings.max_fee_increases,
+                            PendingKind::Bundle,
+                        );
+                    }
+                }
+                State::Pending(attempt_until_block, max_until_block, ref pending_kind) => {
+                    // TODO wait 1 block
+
+                    // Check for nonce increment
+                    if self.check_for_and_log_transaction_update().await {
+                        // returns true if a transaction was mined
+                        state = State::Building;
+                        continue;
+                    }
+
+                    if last_block < attempt_until_block {
+                        // wait for next block
+                        continue;
+                    }
+
+                    match pending_kind {
+                        PendingKind::Bundle => {
+                            if last_block < max_until_block {
+                                // build bundle replacement
+                                // if a replacement is possible, restart the max until block
+                                if self.send_bundle().await {
+                                    state = State::Pending(
+                                        last_block + self.settings.max_blocks_to_wait_for_mine,
+                                        max_until_block,
+                                        PendingKind::Bundle,
+                                    )
+                                } else {
+                                    // no bundle, try next attempt
+                                    state = State::Pending(
+                                        last_block + 1,
+                                        max_until_block,
+                                        PendingKind::Bundle,
+                                    )
+                                }
+                            } else {
+                                // issue cancellation
+                                if !self.send_cancellation().await {
+                                    // no cancellation, moving back to building
+                                    state = State::Building;
+                                    continue;
+                                };
+
+                                state = State::Pending(
+                                    last_block + self.settings.max_blocks_to_wait_for_mine,
+                                    last_block
+                                        + self.settings.max_blocks_to_wait_for_mine
+                                            * self.settings.max_fee_increases,
+                                    PendingKind::Cancel,
+                                )
+                            }
+                        }
+                        PendingKind::Cancel => {
+                            if last_block < max_until_block {
+                                // build cancellation replacement
+                                self.send_cancellation().await;
+                                state = State::Pending(
+                                    last_block + self.settings.max_blocks_to_wait_for_mine,
+                                    max_until_block,
+                                    PendingKind::Cancel,
+                                )
+                            } else {
+                                // bail
+                                state = State::Building;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_bundle(&self) -> bool {
+        todo!()
+    }
+
+    async fn send_cancellation(&self) -> bool {
+        todo!()
+    }
+
+    // Checks for a transaction update and logs the result. Returns `true` if a transaction was mined.
+    async fn check_for_and_log_transaction_update(&self) -> bool {
         let update = self.transaction_tracker.check_for_update_now().await;
         let update = match update {
             Ok(update) => update,
             Err(error) => {
                 error!("Failed to check for transaction updates: {error:#?}");
-                return;
+                return false;
             }
         };
         let Some(update) = update else {
-            return;
+            return false;
         };
         match update {
             TrackerUpdate::Mined {
@@ -316,8 +468,9 @@ where
                 } else {
                     info!("Bundle with hash {tx_hash:?} landed in block {block_number} after increasing gas fees {attempt_number} time(s)");
                 }
+                true
             }
-            TrackerUpdate::StillPendingAfterWait => (),
+            TrackerUpdate::StillPendingAfterWait => false,
             TrackerUpdate::LatestTxDropped { nonce } => {
                 self.emit(BuilderEvent::latest_transaction_dropped(
                     self.builder_index,
@@ -328,6 +481,7 @@ where
                     self.entry_point.address(),
                 );
                 info!("Previous transaction dropped by sender");
+                false
             }
             TrackerUpdate::NonceUsedForOtherTx { nonce } => {
                 self.emit(BuilderEvent::nonce_used_for_other_transaction(
@@ -338,16 +492,18 @@ where
                     self.builder_index,
                     self.entry_point.address(),
                 );
-                info!("Nonce used by external transaction")
+                info!("Nonce used by external transaction");
+                true
             }
             TrackerUpdate::ReplacementUnderpriced => {
                 BuilderMetrics::increment_bundle_txn_replacement_underpriced(
                     self.builder_index,
                     self.entry_point.address(),
                 );
-                info!("Replacement transaction underpriced")
+                info!("Replacement transaction underpriced");
+                false
             }
-        };
+        }
     }
 
     /// Constructs a bundle and sends it to the entry point as a transaction. If

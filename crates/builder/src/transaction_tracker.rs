@@ -270,6 +270,7 @@ where
         }
     }
 
+    // TODO move this out to the main loop
     async fn wait_for_update(&mut self) -> anyhow::Result<TrackerUpdate> {
         let start_block_number = self
             .provider
